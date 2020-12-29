@@ -1,0 +1,1069 @@
+%!Encoded,CvsClient0.2
+%!Obj,TextGadgets.NewStyleProc,Pagebreak=F,WYSIWYG=F,Adjust=T,PrinterW=F,FrameW=F,Tabs="",Left=i00000000,Width=i00000264
+%!Font,Oberon10.Scn.Fnt,0F,00
+MODULE CvsClient;	(* pjm %!Obj,TimeStamps.New,Color=i0000000F,Font="Oberon10.Scn.Fnt"
+ *)
+
+(** Oberon client for CVS. *)
+
+IMPORT FileDir, Files, Objects, Fonts, Reals, Texts, Display, Oberon;
+
+CONST
+	Version = "CvsClient0.2";
+	CvsExt = ".cvs";
+	BakExt = ".Bak";
+	SambaHack = TRUE;	(* Samba/FAT can only represent even seconds *)
+	Modify = FALSE;
+
+TYPE
+	Attr = POINTER TO RECORD (Objects.AttrMsg)
+		next: Attr;
+	END;
+
+VAR
+	w: Texts.Writer;
+	enumR: Files.Rider;
+	enumObj: Objects.Object;
+	hex: ARRAY 17 OF CHAR;
+	isStrCh, isPlainCh: ARRAY 256 OF BOOLEAN;
+	init: LONGINT;
+	dummy: ARRAY 1 OF CHAR;
+	root: Attr;
+
+(* Append "from" to "to"; trap on overflow. *)
+
+PROCEDURE Append(from: ARRAY OF CHAR; VAR to: ARRAY OF CHAR);
+VAR i, j: LONGINT;
+BEGIN
+	j := 0; WHILE to[j] # 0X DO INC(j) END;
+	i := 0; WHILE from[i] # 0X DO to[j] := from[i]; INC(i); INC(j) END;
+	to[j] := 0X
+END Append;
+
+(* Various ASCII file write procedures. *)
+
+PROCEDURE WriteLn(VAR r: Files.Rider);
+BEGIN
+	Files.Write(r, 0AX)
+END WriteLn;
+
+PROCEDURE WriteHexByte(VAR r: Files.Rider; x: CHAR);
+BEGIN
+	Files.Write(r, hex[ORD(x) DIV 10H]);
+	Files.Write(r, hex[ORD(x) MOD 10H])
+END WriteHexByte;
+
+PROCEDURE WriteHex(VAR r: Files.Rider; x: LONGINT);
+BEGIN
+	WriteHexByte(r, CHR(x DIV 1000000H MOD 100H));
+	WriteHexByte(r, CHR(x DIV 10000H MOD 100H));
+	WriteHexByte(r, CHR(x DIV 100H MOD 100H));
+	WriteHexByte(r, CHR(x MOD 100H))
+END WriteHex;
+
+(* Write a quoted character. *)
+
+PROCEDURE WriteQuote(VAR r: Files.Rider; x: CHAR);
+BEGIN
+	Files.Write(r, "%25"); WriteHexByte(r, x)
+END WriteQuote;
+
+(* Write a character, quoting special characters. *)
+
+PROCEDURE Write(VAR r: Files.Rider; x: CHAR);
+BEGIN
+	IF x = 0DX THEN
+		WriteLn(r)
+	ELSIF (x = 9X) OR (x >= 20X) & (x <= 7EX) & (x # "%25") THEN
+		Files.Write(r, x)
+	ELSE
+		WriteQuote(r, x)
+	END
+END Write;
+
+(* Write a string, quoting special characters. *)
+
+PROCEDURE WriteString(VAR r: Files.Rider; s: ARRAY OF CHAR);
+VAR i: LONGINT; ch: CHAR;
+BEGIN
+	i := 0;
+	LOOP
+		ch := s[i];
+		IF ch = 0X THEN EXIT END;
+		IF isStrCh[ORD(ch)] THEN
+			Files.Write(r, ch)
+		ELSE
+			WriteQuote(r, ch)
+		END;
+		INC(i)
+	END
+END WriteString;
+
+(* Write the escape sequence. *)
+
+PROCEDURE WriteEsc(VAR r: Files.Rider);
+BEGIN
+	Files.Write(r, "%25"); Files.Write(r, "!")
+END WriteEsc;
+
+(* Enumerator for WriteAttr. *)
+
+PROCEDURE EnumAttr(name: ARRAY OF CHAR);
+VAR msg: Objects.AttrMsg; high, low: LONGINT;
+BEGIN
+	msg.res := -1; msg.id := Objects.get; COPY(name, msg.name);
+	enumObj.handle(enumObj, msg);
+	IF (msg.res >= 0) & (msg.class # Objects.Inval) THEN
+		Write(enumR, ","); WriteString(enumR, name); Write(enumR, "=");
+		CASE msg.class OF
+			Objects.String:
+				Write(enumR, 22X); WriteString(enumR, msg.s); Write(enumR, 22X)
+			|Objects.Int:
+				Write(enumR, "i"); WriteHex(enumR, msg.i)
+			|Objects.Real:
+				Write(enumR, "r"); WriteHex(enumR, Reals.Int(msg.x))
+			|Objects.LongReal:
+				Write(enumR, "R"); Reals.IntL(msg.y, high, low);
+				WriteHex(enumR, high); WriteHex(enumR, low)
+			|Objects.Char:
+				Write(enumR, "c"); WriteHexByte(enumR, msg.c)
+			|Objects.Bool:
+				IF msg.b THEN Write(enumR, "T") ELSE Write(enumR, "F") END
+		END
+	END
+END EnumAttr;
+
+(* Write the attributes of an object. *)
+
+PROCEDURE WriteAttr(VAR r: Files.Rider; obj: Objects.Object);
+VAR msg: Objects.AttrMsg;
+BEGIN
+	msg.res := -1; msg.id := Objects.enum; msg.Enum := EnumAttr;
+	enumObj := obj;
+	Files.Set(enumR, Files.Base(r), Files.Pos(r));
+	obj.handle(obj, msg);
+	Files.Set(r, Files.Base(r), Files.Pos(enumR));
+	Files.Set(enumR, NIL, 0);
+	enumObj := NIL
+END WriteAttr;
+
+(* Get string attribute from an object. *)
+
+PROCEDURE GetStr(obj: Objects.Object; name: ARRAY OF CHAR; VAR val: ARRAY OF CHAR);
+VAR msg: Objects.AttrMsg;
+BEGIN
+	msg.res := -1; msg.id := Objects.get; COPY(name, msg.name);
+	obj.handle(obj, msg);
+	IF (msg.res >= 0) & (msg.class = Objects.String) THEN
+		COPY(msg.s, val)
+	ELSE
+		val[0] := 0X
+	END
+END GetStr;
+
+(* Check for objects that can be stored losslessly (no warning generated for these). *)
+
+PROCEDURE SimpleObj(VAR gen: ARRAY OF CHAR): BOOLEAN;
+BEGIN
+	RETURN (gen = "TextGadgets.NewStyleProc") OR (gen = "TimeStamps.New") OR (gen = "TextGadgets.NewControl")
+END SimpleObj;
+
+(* Convert a text to encoded ASCII file format.  "lost" returns the number of objects converted with loss. *)
+
+PROCEDURE ExportText(t: Texts.Text; VAR r: Files.Rider; VAR lost: LONGINT);
+VAR
+	tr: Texts.Reader; lib: Objects.Library; obj: Objects.Object;
+	vofs, col: SHORTINT; ch: CHAR; gen: ARRAY 64 OF CHAR;
+BEGIN
+	lost := 0;
+	lib := Fonts.Default; vofs := 0; col := Display.FG;
+	WriteEsc(r); WriteString(r, "Encoded"); Write(r, ","); WriteString(r, Version); WriteLn(r);
+	Texts.OpenReader(tr, t, 0);
+	Texts.Read(tr, ch);
+	WHILE ~tr.eot DO
+		IF ~((tr.lib = lib) & (tr.col = col) & (tr.voff = vofs)) THEN	(* attribute change or object *)
+			IF tr.lib IS Fonts.Font THEN	(* attribute change *)
+				IF (tr.lib = lib) & (tr.voff = vofs) THEN	(* only color change *)
+					lib := tr.lib; col := tr.col; vofs := tr.voff;
+					WriteEsc(r); WriteString(r, "Color"); Write(r, ","); WriteHexByte(r, CHR(col));
+					WriteLn(r); Write(r, ch)
+				ELSE
+					lib := tr.lib; col := tr.col; vofs := tr.voff;
+					WriteEsc(r); WriteString(r, "Font"); Write(r, ","); WriteString(r, lib.name); Write(r, ",");
+					WriteHexByte(r, CHR(col)); Write(r, ","); WriteHexByte(r, CHR(vofs));
+					WriteLn(r); Write(r, ch)
+				END
+			ELSE	(* object *)
+				tr.lib.GetObj(tr.lib, ORD(ch), obj);
+				GetStr(obj, "Gen", gen);
+				WriteEsc(r); WriteString(r, "Obj"); Write(r, ","); WriteString(r, gen);
+				WriteAttr(r, obj); WriteLn(r);
+				IF ~SimpleObj(gen) THEN INC(lost) END
+			END
+		ELSE
+			Write(r, ch)
+		END;
+		Texts.Read(tr, ch)
+	END
+END ExportText;
+
+(** Export Oberon texts to ASCII file format. *)
+
+PROCEDURE ExportTexts*;	(** { text ["=>" file] } ~ *)
+VAR
+	t: Texts.Text; r: Files.Rider; time, date, lost, errors, files: LONGINT; s: Texts.Scanner;
+	f: Files.File; in, out: ARRAY 64 OF CHAR;
+BEGIN
+	files := 0; errors := 0;
+	Texts.OpenScanner(s, Oberon.Par.text, Oberon.Par.pos); Texts.Scan(s);
+	WHILE s.class IN {Texts.Name, Texts.String} DO
+		COPY(s.s, in); Texts.Scan(s);
+		IF (s.class = Texts.Char) & (s.c = "=") THEN
+			Texts.Scan(s);
+			IF (s.class = Texts.Char) & (s.c = ">") THEN Texts.Scan(s) ELSE s.class := Texts.Inval END;
+			IF s.class IN {Texts.Name, Texts.String} THEN
+				COPY(s.s, out); Texts.Scan(s)
+			ELSE
+				s.class := Texts.Inval
+			END
+		ELSE
+			COPY(in, out); Append(CvsExt, out)
+		END;
+		IF s.class # Texts.Inval THEN
+			INC(files); Texts.WriteString(w, in);
+			NEW(t); Texts.Open(t, in);
+			IF t.len # 0 THEN
+				Texts.WriteString(w, " => "); Texts.WriteString(w, out);
+				Files.Set(r, Files.New(out), 0);
+				IF Files.Base(r) # NIL THEN
+					ExportText(t, r, lost);
+					Files.Register(Files.Base(r));
+					IF lost # 0 THEN
+						Texts.WriteString(w, " lost "); Texts.WriteInt(w, lost, 1);
+						Texts.WriteString(w, " object(s)"); INC(errors)
+					END;
+					f := Files.Old(in); Files.GetDate(f, time, date);
+					IF SambaHack & ODD(time) THEN
+						DEC(time);	(* round seconds down to even *)
+						Files.SetDate(f, time, date); Files.Close(f)
+					END;
+					Files.SetDate(Files.Base(r), time, date); Files.Close(Files.Base(r))
+				ELSE
+					Texts.WriteString(w, " create error"); INC(errors)
+				END
+			ELSE
+				Texts.WriteString(w, " empty, skipped"); INC(errors)
+			END
+		ELSE
+			Texts.WriteString(w, "Syntax error")
+		END;
+		Texts.WriteLn(w); Texts.Append(Oberon.Log, w.buf)
+	END;
+	IF (files > 1) & (errors # 0) THEN
+		Texts.WriteInt(w, errors, 1); Texts.WriteString(w, " error(s)");
+		Texts.WriteLn(w); Texts.Append(Oberon.Log, w.buf)
+	END
+END ExportTexts;
+
+PROCEDURE IsHexChar(ch: CHAR): BOOLEAN;
+BEGIN
+	RETURN ((ch >= "0") & (ch <= "9")) OR ((CAP(ch) >= "A") & (CAP(ch) <= "F"))
+END IsHexChar;
+
+PROCEDURE HexVal(ch: CHAR): LONGINT;
+BEGIN
+	IF (ch >= "0") & (ch <= "9") THEN
+		RETURN ORD(ch)-ORD("0")
+	ELSIF (CAP(ch) >= "A") & (CAP(ch) <= "F") THEN
+		RETURN ORD(CAP(ch))-ORD("A")+10
+	ELSE
+		HALT(99)
+	END
+END HexVal;
+
+PROCEDURE GenObject(gen: ARRAY OF CHAR): Objects.Object;
+VAR obj: Objects.Object; res: INTEGER;
+BEGIN
+	Objects.NewObj := NIL;
+	Oberon.Call(gen, Oberon.Par, FALSE, res);
+	obj := Objects.NewObj; Objects.NewObj := NIL;
+	RETURN obj
+END GenObject;
+
+PROCEDURE ImportText(VAR r: Files.Rider; t: Texts.Text): BOOLEAN;
+VAR b: Texts.Writer; i: LONGINT; ch: CHAR; ok: BOOLEAN; s: ARRAY 64 OF CHAR;
+
+	PROCEDURE Error(msg: ARRAY OF CHAR);
+	BEGIN
+		Texts.WriteString(w, msg); Texts.WriteString(w, " at ");
+		Texts.WriteInt(w, Files.Pos(r), 1); ok := FALSE
+	END Error;
+
+	PROCEDURE ReadHex2(VAR x: LONGINT);
+	BEGIN
+		x := 0;
+		IF IsHexChar(ch) THEN
+			x := HexVal(ch)*10H; Files.Read(r, ch);
+			IF IsHexChar(ch) THEN
+				INC(x, HexVal(ch)); Files.Read(r, ch)
+			ELSE
+				Error("hexadecimal character expected")
+			END
+		ELSE
+			Error("hexadecimal character expected")
+		END
+	END ReadHex2;
+
+	PROCEDURE ReadHInt(VAR x: LONGINT);
+	VAR i, j: LONGINT;
+	BEGIN
+		i := 0; x := 0;
+		WHILE (i # 4) & ok DO
+			ReadHex2(j); x := x * 100H + j;
+			INC(i)
+		END
+	END ReadHInt;
+	
+	PROCEDURE ReadTextAttr;	(* "%25!Font," already read *)
+	VAR col, vofs: LONGINT; font: Fonts.Font;
+	BEGIN
+		ReadString(s);
+		IF (s # "") & (ch = ",") THEN
+			Files.Read(r, ch); ReadHex2(col);
+			IF ok THEN
+				IF ch = "," THEN
+					Files.Read(r, ch); ReadHex2(vofs);
+					IF ok THEN
+						IF ch = 0AX THEN
+							Files.Read(r, ch);
+							font := Fonts.This(s);
+							IF font # NIL THEN
+								Texts.SetFont(b, font);
+								Texts.SetOffset(b, SHORT(SHORT(vofs)));
+								Texts.SetColor(b, SHORT(SHORT(col)))
+							ELSE
+								Error("font not found")
+							END
+						ELSE
+							Error("LF expected")
+						END
+					END
+				ELSE
+					Error("',' expected")
+				END
+			END
+		ELSE
+			Error("',' expected")
+		END
+	END ReadTextAttr;
+	
+	PROCEDURE ReadColor;	(* "%25!Color," already read *)
+	VAR col: LONGINT;
+	BEGIN
+		ReadHex2(col);
+		IF ok THEN
+			IF ch = 0AX THEN
+				Files.Read(r, ch);
+				Texts.SetColor(b, SHORT(SHORT(col)))
+			ELSE
+				Error("LF expected")
+			END
+		END
+	END ReadColor;
+	
+	PROCEDURE ReadObj;	(* "%25!Obj," already read *)
+	VAR obj: Objects.Object; low, high: LONGINT; msg: Objects.AttrMsg;
+	BEGIN
+		ReadString(s); obj := GenObject(s);
+		IF obj # NIL THEN
+			WHILE (ch = ",") & ok DO
+				Files.Read(r, ch); ReadString(s); COPY(s, msg.name);
+				IF msg.name # "" THEN
+					IF ch = "=" THEN
+						Files.Read(r, ch);
+						IF ch = 22X THEN	(* astr *)
+							msg.class := Objects.String;
+							Files.Read(r, ch); ReadString(msg.s);
+							IF ch = 22X THEN Files.Read(r, ch) ELSE Texts.WriteString(w, msg.s); Error('" expected') END
+						ELSIF ch = "i" THEN	(* aint *)
+							msg.class := Objects.Int; Files.Read(r, ch); ReadHInt(msg.i)
+						ELSIF ch = "r" THEN
+							msg.class := Objects.Real; Files.Read(r, ch); ReadHInt(low); msg.x := Reals.Real(low)
+						ELSIF ch = "R" THEN
+							msg.class := Objects.LongReal; Files.Read(r, ch); ReadHInt(high); ReadHInt(low);
+							msg.y := Reals.RealL(high, low)
+						ELSIF ch = "c" THEN
+							msg.class := Objects.Char; Files.Read(r, ch); ReadHex2(low); msg.c := CHR(low)
+						ELSIF (ch = "T") OR (ch = "F") THEN
+							msg.class := Objects.Bool; msg.b := (ch = "T"); Files.Read(r, ch)
+						ELSE
+							Error("attribute value expected")
+						END;
+						IF ok THEN
+							msg.id := Objects.set; msg.res := -1;
+							obj.handle(obj, msg);
+							IF msg.res < 0 THEN
+								Append(" attribute set error", s); Error(s)
+							END
+						END
+					ELSE
+						Error("= expected")
+					END
+				ELSE
+					Error("attribute name expected")
+				END
+			END;
+			IF ok THEN
+				IF ch = 0AX THEN Files.Read(r, ch) ELSE Error("LF expected") END
+			END;
+			IF ok THEN Texts.WriteObj(b, obj) END
+		ELSE
+			Append(" object not found", s); Error(s)
+		END
+	END ReadObj;
+
+	PROCEDURE ReadString(VAR s: ARRAY OF CHAR);
+	VAR i, x: LONGINT;
+	BEGIN
+		i := 0;
+		LOOP
+%!Color,03
+			(*Texts.Write(w, "("); Texts.WriteInt(w, ORD(ch), 1); Texts.Write(w, ")");*)
+%!Color,0F
+			IF r.eof OR (i = LEN(s)-1) OR ~ok THEN EXIT END;
+			IF ch = "%25" THEN
+				Files.Read(r, ch);
+				IF IsHexChar(ch) THEN	(* quoted *)
+					ReadHex2(x); s[i] := CHR(x); INC(i)
+				ELSE
+					Error("hexadecimal character expected")
+				END
+			ELSIF ~isStrCh[ORD(ch)] THEN
+				EXIT
+			ELSE
+				s[i] := ch; INC(i); Files.Read(r, ch)
+			END
+		END;
+%!Color,03
+		(*Texts.Write(w, "["); Texts.WriteString(w, s); Texts.Write(w, "]");*)
+%!Color,0F
+		s[i] := 0X
+	END ReadString;
+	
+	PROCEDURE ReadHeader;
+	BEGIN
+		Files.Read(r, ch); s[0] := ch; Files.Read(r, ch); s[1] := ch; s[2] := 0X;
+		IF s = "%25!" THEN
+			Files.Read(r, ch); ReadString(s);
+			IF s = "Encoded" THEN
+				IF ch = "," THEN
+					Files.Read(r, ch); ReadString(s);
+					IF s = Version THEN
+						IF ch = 0AX THEN
+							Files.Read(r, ch)
+						ELSE
+							Error("LF expected")
+						END
+					ELSE
+						Error("incompatible version")
+					END
+				ELSE
+					Error("',' expected")
+				END
+			ELSE
+				Error("'Encoded' expected")
+			END
+		ELSE
+			Error("%25! expected")
+		END
+	END ReadHeader;
+	
+BEGIN
+	ok := TRUE; ReadHeader;
+	IF ok THEN
+		Texts.OpenWriter(b);
+		WHILE ~r.eof & ok DO
+			IF ch = "%25" THEN	(* quoted or textattr or obj *)
+				Files.Read(r, ch);
+				IF ch = "!" THEN	(* textattr or color or obj *)
+					Files.Read(r, ch); ReadString(s);
+					IF ch = "," THEN
+						Files.Read(r, ch);
+						IF s = "Font" THEN	(* textattr *)
+							ReadTextAttr
+						ELSIF s = "Color" THEN	(* color *)
+							ReadColor
+						ELSIF s = "Obj" THEN	(* obj *)
+							ReadObj
+						ELSE
+							Error("unknown keyword")
+						END
+					ELSE
+						Error("',' expected")
+					END
+				ELSIF IsHexChar(ch) THEN	(* quoted *)
+					ReadHex2(i); Texts.Write(b, CHR(i))
+				ELSE
+					Error("unexpected character")
+				END
+			ELSIF isPlainCh[ORD(ch)] THEN
+				IF ch = 0AX THEN Texts.WriteLn(b) ELSE Texts.Write(b, ch) END;
+				Files.Read(r, ch)
+			ELSE
+				Error("plain character expected")
+			END
+		END;
+		Texts.Append(t, b.buf)
+	END;
+	RETURN ok
+END ImportText;
+
+(** Import Oberon texts from ASCII file format. *)
+
+PROCEDURE ImportTexts*;	(** { file ["=>" text] } ~ *)
+VAR
+	t: Texts.Text; r: Files.Rider; time, date, i, j: LONGINT; f: Files.File; s: Texts.Scanner;
+	in, out: ARRAY 64 OF CHAR;
+BEGIN
+	Texts.OpenScanner(s, Oberon.Par.text, Oberon.Par.pos); Texts.Scan(s);
+	WHILE s.class IN {Texts.Name, Texts.String} DO
+		COPY(s.s, in); Texts.Scan(s);
+		IF (s.class = Texts.Char) & (s.c = "=") THEN
+			Texts.Scan(s);
+			IF (s.class = Texts.Char) & (s.c = ">") THEN Texts.Scan(s) ELSE s.class := Texts.Inval END;
+			IF s.class IN {Texts.Name, Texts.String} THEN
+				COPY(s.s, out); Texts.Scan(s)
+			ELSE
+				s.class := Texts.Inval
+			END
+		ELSE
+			out := CvsExt;
+			i := 0; WHILE in[i] # 0X DO INC(i) END;
+			j := 0; WHILE out[j] # 0X DO INC(j) END;
+			WHILE (i # 0) & (j # 0) & (in[i] = out[j]) DO DEC(i); DEC(j) END;
+			IF (i # 0) & (j = 0) THEN	(* Ext occurs at end of in *)
+				COPY(in, out); out[i] := 0X	(* chop off Ext *)
+			ELSE
+				COPY(in, out); Append(".Text", out)
+			END
+		END;
+		IF s.class # Texts.Inval THEN
+			Texts.WriteString(w, in);
+			Files.Set(r, Files.Old(in), 0);
+			IF Files.Base(r) # NIL THEN
+				Texts.WriteString(w, " => "); Texts.WriteString(w, out); Texts.Write(w, " ");
+				f := Files.New(out);
+				IF f # NIL THEN
+					NEW(t); Texts.Open(t, "");
+					IF ImportText(r, t) THEN
+						Texts.Store(t, f, 0, i);	(* ignore i *)	%!Color,01
+(* what about text document? *)
+%!Color,0F
+						Files.Register(f);
+						Files.GetDate(Files.Base(r), time, date);
+						Files.SetDate(f, time, date); Files.Close(f)
+					END
+				ELSE
+					Texts.WriteString(w, " create error")
+				END
+			ELSE
+				Texts.WriteString(w, " not found, skipped")
+			END
+		ELSE
+			Texts.WriteString(w, "Syntax error")
+		END;
+		Texts.WriteLn(w); Texts.Append(Oberon.Log, w.buf)
+	END
+END ImportTexts;
+
+PROCEDURE Younger(l, r: Files.File): BOOLEAN;
+VAR rt, rd, lt, ld: LONGINT;
+BEGIN
+	IF l = NIL THEN
+		RETURN FALSE
+	ELSIF r = NIL THEN
+		RETURN TRUE
+	ELSE
+		Files.GetDate(r, rt, rd); Files.GetDate(l, lt, ld);
+		RETURN (ld > rd) OR ((ld = rd) & (lt > rt))
+	END
+END Younger;
+
+(** Synchronize external CVS working directories and internal working directory using timestamps. *)
+
+PROCEDURE Synchronize*;	(** remoteprefix localprefix { files } ~ *)
+VAR
+	s: Texts.Scanner; rem, loc: Files.File; import, export: Texts.Writer;
+	t: Texts.Text; rempre, locpre, remote, local: ARRAY 64 OF CHAR;
+BEGIN
+	Texts.OpenScanner(s, Oberon.Par.text, Oberon.Par.pos); Texts.Scan(s);
+	IF s.class IN {Texts.Name, Texts.String} THEN
+		COPY(s.s, rempre); Texts.Scan(s);
+		IF s.class IN {Texts.Name, Texts.String} THEN
+			COPY(s.s, locpre); Texts.Scan(s);
+			Texts.OpenWriter(import); Texts.WriteString(import, "CvsClient.ImportTexts");
+			Texts.OpenWriter(export); Texts.WriteString(export, "CvsClient.ExportTexts");
+			WHILE s.class IN {Texts.Name, Texts.String} DO
+				COPY(rempre, remote); Append(s.s, remote); Append(CvsExt, remote); rem := Files.Old(remote);
+				COPY(locpre, local); Append(s.s, local); loc := Files.Old(local);
+				IF (loc = NIL) & (rem = NIL) THEN
+					Texts.WriteString(w, local); Texts.WriteString(w, " and ");
+					Texts.WriteString(w, remote); Texts.WriteString(w, " not found");
+					Texts.WriteLn(w); Texts.Append(Oberon.Log, w.buf)
+				ELSIF Younger(loc, rem) THEN
+					Texts.WriteLn(export); Texts.Write(export, 9X);
+					Texts.WriteString(export, local);
+					Texts.WriteString(export, " => ");
+					Texts.WriteString(export, remote)
+				ELSIF Younger(rem, loc) THEN
+					Texts.WriteLn(import); Texts.Write(import, 9X);
+					Texts.WriteString(import, remote);
+					Texts.WriteString(import, " => ");
+					Texts.WriteString(import, local)
+				END;
+				Texts.Scan(s)
+			END;
+			Texts.WriteString(export, " ~"); Texts.WriteLn(export); Texts.WriteString(import, " ~");
+			NEW(t); Texts.Open(t, "");
+			Texts.Append(t, export.buf); Texts.Append(t, import.buf);
+			Oberon.OpenText("", t, 400, 400)
+		END
+	END
+END Synchronize;
+
+PROCEDURE SplitPath(full: ARRAY OF CHAR; VAR path, name, ext: ARRAY OF CHAR);
+VAR i, j, k: LONGINT;
+BEGIN
+	i := 0; j := -1; k := -1;	(* find last "/" and "." *)
+	WHILE full[i] # 0X DO
+		IF full[i] = "\" THEN j := i; full[i] := "/"
+		ELSIF full[i] = "/" THEN j := i
+		ELSIF full[i] = "." THEN k := i
+		END;
+		INC(i)
+	END;
+	FOR i := 0 TO j DO path[i] := full[i] END;
+	INC(j); path[j] := 0X;
+	i := 0; WHILE (full[j] # 0X) & (j # k) DO name[i] := full[j]; INC(i); INC(j) END;
+	name[i] := 0X;
+	i := 0; WHILE full[j] # 0X DO ext[i] := full[j]; INC(i); INC(j) END;
+	ext[i] := 0X
+END SplitPath;
+
+(*
+PROCEDURE Lower(VAR s: ARRAY OF CHAR);
+VAR i: LONGINT; ch: CHAR;
+BEGIN
+	i := 0;
+	LOOP
+		ch := s[i];
+		IF ch = 0X THEN EXIT END;
+		IF (ch >= "A") & (ch <= "Z") THEN s[i] := CHR(ORD(ch)+32) END;
+		INC(i)
+	END
+END Lower;
+*)
+
+(* Enumerator for GetAttrs. *)
+
+PROCEDURE GetEnumAttr(name: ARRAY OF CHAR);
+VAR msg: Attr; prev: Attr;
+BEGIN
+	NEW(msg);
+	msg.res := -1; msg.id := Objects.get; COPY(name, msg.name);
+	enumObj.handle(enumObj, msg^);
+	IF (msg.res >= 0) & (msg.class # Objects.Inval) THEN
+		prev := root;
+		WHILE (prev.next # NIL) & (name < prev.next.name) DO prev := prev.next END;
+		IF (prev.next = NIL) OR (name # prev.next.name) THEN
+			msg.next := prev.next; prev.next := msg
+		END
+	END
+END GetEnumAttr;
+
+PROCEDURE GetAttrs(obj: Objects.Object): Attr;
+VAR ret: Attr; msg: Objects.AttrMsg;
+BEGIN
+	root.next := NIL;
+	msg.res := -1; msg.id := Objects.enum; msg.Enum := GetEnumAttr;
+	enumObj := obj;
+	obj.handle(obj, msg);
+	enumObj := NIL;
+	ret := root.next; root.next := NIL;
+	RETURN ret
+END GetAttrs;
+
+PROCEDURE TextsEqual(t1, t2: Texts.Text): BOOLEAN;
+VAR r1, r2: Texts.Reader; obj1, obj2: Objects.Object; attr1, attr2: Attr; ch1, ch2: CHAR; gen1, gen2: ARRAY 64 OF CHAR;
+BEGIN
+	Texts.OpenReader(r1, t1, 0); Texts.OpenReader(r2, t2, 0);
+	LOOP
+		Texts.Read(r1, ch1); Texts.Read(r2, ch2);
+		IF r1.eot OR r2.eot THEN EXIT END;
+		IF r1.col # r2.col THEN EXIT END;
+		IF r1.voff # r2.voff THEN EXIT END;
+		IF r1.lib.name # r2.lib.name THEN EXIT END;
+		IF r1.lib IS Fonts.Font THEN
+			IF ch1 # ch2 THEN EXIT END
+		ELSE
+			r1.lib.GetObj(r1.lib, ORD(ch1), obj1);
+			GetStr(obj1, "Gen", gen1);
+			r1.lib.GetObj(r2.lib, ORD(ch2), obj2);
+			GetStr(obj2, "Gen", gen2);
+			IF gen1 # gen2 THEN EXIT END;
+			attr1 := GetAttrs(obj1);
+			attr2 := GetAttrs(obj2);
+			WHILE (attr1 # NIL) & (attr2 # NIL) DO
+				IF attr1.name # attr2.name THEN EXIT END;
+				IF attr1.class # attr2.class THEN EXIT END;
+				CASE attr1.class OF
+					Objects.String: IF attr1.s # attr2.s THEN EXIT END
+					|Objects.Int: IF attr1.i # attr2.i THEN EXIT END
+					|Objects.Real: IF attr1.x # attr2.x THEN EXIT END
+					|Objects.LongReal: IF attr1.y # attr2.y THEN EXIT END
+					|Objects.Char: IF attr1.c # attr2.c THEN EXIT END
+					|Objects.Bool: IF attr1.b # attr2.b THEN EXIT END
+				END;
+				attr1 := attr1.next; attr2 := attr2.next
+			END;
+			IF (attr1 # NIL) OR (attr2 # NIL) THEN EXIT END
+		END
+	END;
+	RETURN r1.eot & r2.eot
+END TextsEqual;
+
+PROCEDURE ImportUpdateCvsFile(src, dst: ARRAY OF CHAR; srctime, srcdate: LONGINT);
+VAR
+	sf, df: Files.File; r: Files.Rider; nt, ot: Texts.Text; i, dstdate, dsttime: LONGINT; res: INTEGER;
+	bak: FileDir.FileName;
+BEGIN
+	df := Files.Old(dst);
+	Files.GetDate(df, dsttime, dstdate);
+	IF (dsttime # srctime) OR (dstdate # srcdate) THEN
+		sf := Files.Old(src);
+		IF sf # NIL THEN
+			Files.Set(r, sf, 0);
+			NEW(nt); Texts.Open(nt, "");
+			IF ImportText(r, nt) THEN
+				NEW(ot); Texts.Open(ot, dst);
+				IF ~TextsEqual(ot, nt) THEN
+					df := Files.New(dst);
+					IF df # NIL THEN
+						COPY(dst, bak); Append(BakExt, bak);
+						IF Modify THEN Files.Rename(dst, bak, res) ELSE res := 1 END;	(* ignore res *)
+						Texts.Store(nt, df, 0, i);	(* ignore i *)
+						IF Modify THEN
+							Files.Register(df); Files.SetDate(df, srctime, srcdate); Files.Close(df)
+						ELSE
+							Texts.WriteString(w, " modify disabled")
+						END;
+						IF res = 0 THEN
+							Texts.WriteString(w, " ("); Texts.WriteString(w, bak);
+							Texts.WriteString(w, " created)")
+						END
+					ELSE
+						Texts.WriteString(w, " create failed")
+					END
+				ELSE
+					Texts.WriteString(w, " no change")
+				END
+			END
+		ELSE
+			Texts.WriteString(w, " open failed")
+		END
+	ELSE
+		Texts.WriteString(w, " timestamps match")
+	END
+END ImportUpdateCvsFile;
+				
+PROCEDURE ImportNewCvsFile(src, dst: ARRAY OF CHAR; srctime, srcdate: LONGINT);
+VAR sf, df: Files.File; r: Files.Rider; i: LONGINT; nt: Texts.Text;
+BEGIN
+	sf := Files.Old(src);
+	IF sf # NIL THEN
+		Files.Set(r, sf, 0);
+		NEW(nt); Texts.Open(nt, "");
+		IF ImportText(r, nt) THEN
+			df := Files.New(dst);
+			IF df # NIL THEN
+				Texts.Store(nt, df, 0, i);	(* ignore i *)
+				IF Modify THEN
+					Files.Register(df); Files.SetDate(df, srctime, srcdate); Files.Close(df)
+				ELSE
+					Texts.WriteString(w, " modify disabled")
+				END
+			ELSE
+				Texts.WriteString(w, " create failed")
+			END
+		END
+	ELSE
+		Texts.WriteString(w, " open failed")
+	END
+END ImportNewCvsFile;
+
+PROCEDURE FilesEqual(f1, f2: Files.File): BOOLEAN;
+VAR r1, r2: Files.Rider; ch1, ch2: CHAR;
+BEGIN
+	Files.Set(r1, f1, 0); Files.Set(r2, f2, 0);
+	REPEAT
+		Files.Read(r1, ch1); Files.Read(r2, ch2);
+	UNTIL r1.eof OR r2.eof OR (ch1 # ch2);
+	RETURN r1.eof & r2.eof
+END FilesEqual;
+
+PROCEDURE CopyFile(sf, df: Files.File);
+VAR sr, dr: Files.Rider; ch: CHAR;
+BEGIN
+	Files.Set(sr, sf, 0); Files.Set(dr, df, 0);
+	LOOP
+		Files.Read(sr, ch);
+		IF sr.eof THEN EXIT END;
+		Files.Write(dr, ch)
+	END
+END CopyFile;
+
+PROCEDURE ImportCopyFile(src, dst: ARRAY OF CHAR; srctime, srcdate: LONGINT);
+VAR sf, df: Files.File; res: INTEGER; copy: BOOLEAN; bak: FileDir.FileName;
+BEGIN
+	sf := Files.Old(src);
+	IF sf # NIL THEN
+		copy := TRUE;
+		df := Files.Old(dst);
+		IF df # NIL THEN
+			IF FilesEqual(sf, df) THEN
+				Texts.WriteString(w, " no change");
+				copy := FALSE
+			END
+		END;
+		IF copy THEN
+			df := Files.New(dst);
+			IF df # NIL THEN
+				COPY(dst, bak); Append(BakExt, bak);
+				IF Modify THEN Files.Rename(dst, bak, res) ELSE res := 1 END;	(* ignore res *)
+				IF Modify THEN
+					CopyFile(sf, df); Files.Register(df);
+					Files.SetDate(df, srctime, srcdate); Files.Close(df)
+				ELSE
+					Texts.WriteString(w, " modify disabled")
+				END;
+				IF res = 0 THEN
+					Texts.WriteString(w, " ("); Texts.WriteString(w, bak);
+					Texts.WriteString(w, " created)")
+				END
+			ELSE
+				Texts.WriteString(w, " create failed")
+			END
+		END
+	ELSE
+		Texts.WriteString(w, " open failed")
+	END
+END ImportCopyFile;
+
+PROCEDURE Importer(path, name: ARRAY OF CHAR; srctime, srcdate, size: LONGINT; attr: SET);
+VAR ext: ARRAY 8 OF CHAR; src, dst: FileDir.FileName;
+BEGIN
+	IF ~(FileDir.Directory IN attr) THEN
+		COPY(path, src); Append("/", src); Append(name, src);
+		Texts.WriteString(w, src);
+		SplitPath(name, dummy, dst, ext);
+		IF ext = CvsExt THEN
+			Texts.WriteString(w, " => "); Texts.WriteString(w, dst);
+			IF Files.Old(dst) # NIL THEN
+				ImportUpdateCvsFile(src, dst, srctime, srcdate)
+			ELSE
+				ImportNewCvsFile(src, dst, srctime, srcdate)
+			END
+		ELSIF ext = BakExt THEN
+			Texts.WriteString(w, " ignored")
+		ELSE
+			Append(ext, dst);
+			Texts.WriteString(w, " => "); Texts.WriteString(w, dst);
+			ImportCopyFile(src, dst, srctime, srcdate)
+		END;
+		Texts.WriteLn(w)
+	END
+END Importer;
+
+PROCEDURE Import*;	(** workingdir *)
+VAR s: Texts.Scanner;
+BEGIN
+	Texts.OpenScanner(s, Oberon.Par.text, Oberon.Par.pos); Texts.Scan(s);
+	IF s.class IN {Texts.Name, Texts.String} THEN
+		FileDir.EnumerateFiles(s.s, "*", TRUE, Importer);
+		Texts.Append(Oberon.Log, w.buf)
+	END
+END Import;
+
+PROCEDURE ExportCvsFile(src, dst: ARRAY OF CHAR; dsttime, dstdate: LONGINT);
+VAR
+	t: Texts.Text; sf, df: Files.File; r: Files.Rider; srctime, srcdate, lost: LONGINT;
+BEGIN
+	sf := Files.Old(src);
+	IF sf # NIL THEN
+		Files.GetDate(sf, srctime, srcdate);
+		IF (srctime # dsttime) OR (srcdate # dstdate) THEN
+			NEW(t); Texts.Open(t, src);
+			df := Files.New(dst);
+			IF df # NIL THEN
+				Files.Set(r, df, 0);
+				ExportText(t, r, lost);
+				IF ~FilesEqual(Files.Old(dst), df) THEN
+					Files.Register(df);
+					Files.SetDate(df, srctime, srcdate); Files.Close(df);
+					IF lost # 0 THEN
+						Texts.WriteString(w, " lost "); Texts.WriteInt(w, lost, 1);
+						Texts.WriteString(w, " object(s)")
+					END
+				ELSE
+					Files.SetDate(sf, dsttime, dstdate); Files.Close(sf);
+					Texts.WriteString(w, " no change")
+				END
+			ELSE
+				Texts.WriteString(w, " create failed")
+			END
+		ELSE
+			Texts.WriteString(w, " timestamps match")
+		END
+	ELSE
+		Texts.WriteString(w, " open failed")
+	END
+END ExportCvsFile;
+
+PROCEDURE Exporter(path, name: ARRAY OF CHAR; dsttime, dstdate, size: LONGINT; attr: SET);
+VAR ext: ARRAY 8 OF CHAR; src, dst: FileDir.FileName;
+BEGIN
+	IF ~(FileDir.Directory IN attr) THEN
+		COPY(path, dst); Append("/", dst); Append(name, dst);
+		SplitPath(name, dummy, src, ext);
+		IF ext = CvsExt THEN
+			Texts.WriteString(w, src); Texts.WriteString(w, " => ");
+			Texts.WriteString(w, dst);
+			ExportCvsFile(src, dst, dsttime, dstdate)
+		ELSIF ext = BakExt THEN
+			Texts.WriteString(w, name); Texts.WriteString(w, " ignored")
+		ELSE
+			Append(ext, src);
+			Texts.WriteString(w, src); Texts.WriteString(w, " => ");
+			Texts.WriteString(w, dst);
+%!Color,01
+			Texts.WriteString(w, " todo")
+%!Color,0F
+		END;
+		Texts.WriteLn(w)
+	END
+END Exporter;
+
+PROCEDURE Export*;	(** workingdir *)
+VAR s: Texts.Scanner;
+BEGIN
+	Texts.OpenScanner(s, Oberon.Par.text, Oberon.Par.pos); Texts.Scan(s);
+	IF s.class IN {Texts.Name, Texts.String} THEN
+		FileDir.EnumerateFiles(s.s, "*", TRUE, Exporter);
+		Texts.Append(Oberon.Log, w.buf)
+	END
+END Export;
+
+BEGIN
+	NEW(root);
+	Texts.OpenWriter(w);
+	hex := "0123456789ABCDEF";
+		(* plain characters *)
+	FOR init := 0 TO 1FH DO isPlainCh[init] := FALSE END;
+	isPlainCh[9] := TRUE; isPlainCh[0AH] := TRUE;
+	FOR init := 20H TO 7EH DO isPlainCh[init] := TRUE END;
+	isPlainCh[25H] := FALSE;
+	FOR init := 7FH TO 0FFH DO isPlainCh[init] := FALSE END;
+		(* string characters *)
+	FOR init := 0 TO 20H DO isStrCh[init] := FALSE END;
+	FOR init := 21H TO 7EH DO isStrCh[init] := TRUE END;
+	isStrCh[22H] := FALSE; isStrCh[25H] := FALSE; isStrCh[2CH] := FALSE; isStrCh[3DH] := FALSE;
+	FOR init := 7FH TO 0FFH DO isStrCh[init] := FALSE END
+END CvsClient.
+
+(*
+Assume:
+o sources in repository on server (in ASCII/CvsClient format)
+o CVS working directory contains local copy (in ASCII/CvsClient format)
+o Oberon directory contains local copy (in Oberon format)
+
+1. Checkout latest version
+  o On CVS host OS: cvs login/cvs checkout to working directory
+  o CvsClient.Import
+    o do not overwrites local changes, but give merge opportunity
+
+CvsClient.Add:
+  create file in working directory
+
+CvsClient.Delete:
+  delete file in working directory
+
+CVS commands:
+Checkout
+Update
+Delete
+Commit
+Lock
+Unlock
+Log
+Status
+*)
+
+(*
+Encoded file format
+
+file = "%25!Encoded," version 0AX { plain | quoted | textattr | color | obj } .
+version = "CvsClient0.2" .
+plain =  9X | 0AX | 20X..24X | 26X..7EX .
+quoted = "%25" hex2 .
+hex2 = hex hex .
+hex = "0".."9" | "A".."F" .
+textattr = "%25!Font," font "," col "," vofs 0AX .
+color = "%25!Color," col 0AX .
+font = str .
+col = hex2 .
+vofs = hex2 .
+str = { 21X | 23X..24X | 26X..2BX | 2DX..3CX | 3EX..7EX | quoted } .
+obj = "%25!Obj," gen { "," objattr } 0AX .
+gen = str .
+objattr = name "=" val .
+name = str .
+val = astr | aint | areal | alongreal | achar | abool .
+astr = 22X str 22X .
+aint = "i" hint .
+areal = "r" hint .
+alongreal = "R" hint hint .
+achar = "c" hex2 .
+abool = "T" | "F" .
+hint = hex2 hex2 hex2 hex2 .
+
+Notes:
+o CR are converted to LF during encoding, and vice versa when decoding.
+o The words "Encoded" and "Font" are not allowed as generator names.
+o The exporter always generates a "plain" or "quoted" after "attr".
+
+Known issues:
+o Most object state is lost during conversion (except for published attributes).
+o E.g. Export does not save the state of a TimeStamp gadget (it is not available as an attribute).
+o Export ignores the attachments (attributes and links) of a TextDoc.
+o Import creates a plain text file, not a TextDoc.
+o Export may create too large names for file system due to added .txt suffix.
+*)
+
+CvsClient.ExportTexts CvsClient.Mod ~
+
+EditTools.OpenUnix CvsClient.Mod.txt ~
+
+CvsClient.ImportTexts Native.Tool.txt => Temp.Text ~
+
+CvsClient.ExportTexts Native.Tool ~
+
+CvsClient.Synchronize "c:/temp/test/" "" Temp.Text Native.Tool Dummy.Text ~
+
+System.Directory Temp.Text\d
+
+CvsClient.Synchronize "c:/temp/test/" "" Kernel.Mod Disks.Mod OFS.Mod OFSDiskVolumes.Mod 
+	OFSN2KFiles.Mod OFSCacheVolumes.Mod OFSN2KBoot.Mod Files.Mod Modules.Mod ~
+
+CvsClient.Import "f:/work/sf.net/nativeoberon/system/" ~
+
+CvsClient.Export "f:/work/sf.net/nativeoberon/system/" ~
